@@ -1,0 +1,2151 @@
+       |/// Utilities for writing and reading ANSI styled text.
+       |module jansi;
+       |
+       |import std.range : isOutputRange;
+       |import std.typecons : Flag;
+       |
+       |/+++ CONSTANTS +++/
+       |
+       |version(JANSI_BetterC)
+       |{
+       |    private enum BetterC = true;
+       |}
+       |else
+       |{
+       |    version(D_BetterC)
+       |    {
+       |        private enum BetterC = true;
+       |    }
+       |    else
+       |    {
+       |        private enum BetterC = false;
+       |    }
+       |}
+       |
+       |/// Used to determine if an `AnsiColour` is a background or foreground colour.
+       |alias IsBgColour = Flag!"isBg";
+       |
+       |/// Used by certain functions to determine if they should only output an ANSI sequence, or output their entire sequence + data.
+       |alias AnsiOnly = Flag!"ansiOnly";
+       |
+       |/// An 8-bit ANSI colour - an index into the terminal's colour palette.
+       |alias Ansi8BitColour = ubyte;
+       |
+       |/// The string that starts an ANSI command sequence.
+       |immutable ANSI_CSI                = "\033[";
+       |
+       |/// The character that delimits ANSI parameters.
+       |immutable ANSI_SEPARATOR          = ';';
+       |
+       |/// The character used to denote that the sequence is an SGR sequence.
+       |immutable ANSI_COLOUR_END         = 'm';
+       |
+       |/// The sequence used to reset all styling.
+       |immutable ANSI_COLOUR_RESET       = ANSI_CSI~"0"~ANSI_COLOUR_END;
+       |
+       |/// The amount to increment an `Ansi4BitColour` by in order to access the background version of the colour.
+       |immutable ANSI_FG_TO_BG_INCREMENT = 10;
+       |
+       |/+++ COLOUR TYPES +++/
+       |
+       |/++
+       | + Defines what type of colour an `AnsiColour` stores.
+       | + ++/
+       |enum AnsiColourType
+       |{
+       |    /// Default, failsafe.
+       |    none,
+       |
+       |    /// 4-bit colours.
+       |    fourBit,
+       |
+       |    /// 8-bit colours.
+       |    eightBit,
+       |
+       |    /// 24-bit colours.
+       |    rgb
+       |}
+       |
+       |/++
+       | + An enumeration of standard 4-bit colours.
+       | +
+       | + These colours will have the widest support between platforms.
+       | + ++/
+       |enum Ansi4BitColour
+       |{
+       |    black           = 30,
+       |    red             = 31,
+       |    green           = 32,
+       |    /// On Powershell, this is displayed as a very white colour.
+       |    yellow          = 33,
+       |    blue            = 34,
+       |    magenta         = 35,
+       |    cyan            = 36,
+       |    /// More gray than true white, use `BrightWhite` for true white.
+       |    white           = 37,
+       |    /// Grayer than `White`.
+       |    brightBlack     = 90,
+       |    brightRed       = 91,
+       |    brightGreen     = 92,
+       |    brightYellow    = 93,
+       |    brightBlue      = 94,
+       |    brightMagenta   = 95,
+       |    brightCyan      = 96,
+       |    brightWhite     = 97
+       |}
+       |
+       |/++
+       | + Contains a 3-byte, RGB colour.
+       | + ++/
+       |@safe
+       |struct AnsiRgbColour
+       |{
+       |    union
+       |    {
+       |        /// The RGB components as an array.
+       |        ubyte[3] components;
+       |
+       |        struct {
+       |            /// The red component.
+       |            ubyte r;
+       |
+       |            /// The green component.
+       |            ubyte g;
+       |
+       |            /// The blue component.
+       |            ubyte b;
+       |        }
+       |    }
+       |
+       |    @safe @nogc nothrow pure:
+       |
+       |    /++
+       |     + Construct this colour from 3 ubyte components, in RGB order.
+       |     +
+       |     + Params:
+       |     +  components = The components to use.
+       |     + ++/
+      4|    this(ubyte[3] components)
+       |    {
+      4|        this.components = components;
+       |    }
+       |
+       |    /++
+       |     + Construct this colour from the 3 provided ubyte components.
+       |     +
+       |     + Params:
+       |     +  r = The red component.
+       |     +  g = The green component.
+       |     +  b = The blue component.
+       |     + ++/
+     19|    this(ubyte r, ubyte g, ubyte b)
+       |    {
+     19|        this.r = r;
+     19|        this.g = g;
+     19|        this.b = b;
+       |    }
+       |}
+       |
+       |private union AnsiColourUnion
+       |{
+       |    Ansi4BitColour fourBit;
+       |    Ansi8BitColour eightBit;
+       |    AnsiRgbColour  rgb;
+       |}
+       |
+       |/++
+       | + Contains any type of ANSI colour and provides the ability to create a valid SGR command to set the foreground/background.
+       | +
+       | + This struct overloads `opAssign` allowing easy assignment from `Ansi4BitColour`, `Ansi8BitColour`, `AnsiRgbColour`, and any user-defined type
+       | + that satisfies `isUserDefinedRgbType`.
+       | + ++/
+       |@safe
+       |struct AnsiColour
+       |{
+       |    private static immutable FG_MARKER        = "38";
+       |    private static immutable BG_MARKER        = "48";
+       |    private static immutable EIGHT_BIT_MARKER = '5';
+       |    private static immutable RGB_MARKER       = '2';
+       |
+       |    /++
+       |     + The maximum amount of characters any singular `AnsiColour` sequence may use.
+       |     +
+       |     + This is often used to create a static array to temporarily, and without allocation, store the sequence for an `AnsiColour`.
+       |     + ++/
+       |    enum MAX_CHARS_NEEDED = "38;2;255;255;255".length;
+       |
+       |    private
+       |    {
+       |        AnsiColourUnion _value;
+       |        AnsiColourType  _type;
+       |        IsBgColour      _isBg;
+       |
+       |        @safe @nogc nothrow
+0000000|        this(IsBgColour isBg) pure
+       |        {
+0000000|            this._isBg = isBg;
+       |        }
+       |    }
+       |
+       |    /// A variant of `.init` that is used for background colours.
+       |    static immutable bgInit = AnsiColour(IsBgColour.yes);
+       |
+       |    /+++ CTORS AND PROPERTIES +++/
+       |    @safe @nogc nothrow pure
+       |    {
+       |        // Seperate, non-templated constructors as that's a lot more documentation-generator-friendly.
+       |
+       |        /++
+       |         + Construct a 4-bit colour.
+       |         +
+       |         + Params:
+       |         +  colour = The 4-bit colour to use.
+       |         +  isBg   = Determines whether this colour sets the foreground or the background.
+       |         + ++/
+     19|        this(Ansi4BitColour colour, IsBgColour isBg = IsBgColour.no)
+       |        {
+     19|            this = colour;
+     19|            this._isBg = isBg;
+       |        }
+       |        
+       |        /++
+       |         + Construct an 8-bit colour.
+       |         +
+       |         + Params:
+       |         +  colour = The 8-bit colour to use.
+       |         +  isBg   = Determines whether this colour sets the foreground or the background.
+       |         + ++/
+     10|        this(Ansi8BitColour colour, IsBgColour isBg = IsBgColour.no)
+       |        {
+     10|            this = colour;
+     10|            this._isBg = isBg;
+       |        }
+       |
+       |        /++
+       |         + Construct an RGB colour.
+       |         +
+       |         + Params:
+       |         +  colour = The RGB colour to use.
+       |         +  isBg   = Determines whether this colour sets the foreground or the background.
+       |         + ++/
+     23|        this(AnsiRgbColour colour, IsBgColour isBg = IsBgColour.no)
+       |        {
+     23|            this = colour;
+     23|            this._isBg = isBg;
+       |        }
+       |
+       |        /++
+       |         + Construct an RGB colour.
+       |         +
+       |         + Params:
+       |         +  r      = The red component.
+       |         +  g      = The green component.
+       |         +  b      = The blue component.
+       |         +  isBg   = Determines whether this colour sets the foreground or the background.
+       |         + ++/
+     13|        this(ubyte r, ubyte g, ubyte b, IsBgColour isBg = IsBgColour.no)
+       |        {
+     13|            this(AnsiRgbColour(r, g, b), isBg);
+       |        }
+       |
+       |        /++
+       |         + Construct an RGB colour.
+       |         +
+       |         + Params:
+       |         +  colour = The user-defined colour type that satisfies `isUserDefinedRgbType`.
+       |         +  isBg   = Determines whether this colour sets the foreground or the background.
+       |         + ++/
+       |        this(T)(T colour, IsBgColour isBg = IsBgColour.no)
+       |        if(isUserDefinedRgbType!T)
+       |        {
+       |            this = colour;
+       |            this._isBg = isBg;
+       |        }
+       |
+       |        /++
+       |         + Allows direct assignment from any type that can also be used in any of this struct's ctors.
+       |         + ++/
+       |        auto opAssign(T)(T colour) return
+       |        if(!is(T == typeof(this)))
+       |        {
+       |            static if(is(T == Ansi4BitColour))
+       |            {
+     19|                this._value.fourBit = colour;
+     19|                this._type = AnsiColourType.fourBit;
+       |            }
+       |            else static if(is(T == Ansi8BitColour))
+       |            {
+     10|                this._value.eightBit = colour;
+     10|                this._type = AnsiColourType.eightBit;
+       |            }
+       |            else static if(is(T == AnsiRgbColour))
+       |            {
+     23|                this._value.rgb = colour;
+     23|                this._type = AnsiColourType.rgb;
+       |            }
+       |            else static if(isUserDefinedRgbType!T)
+       |            {
+       |                this = colour.to!AnsiColour();
+       |            }
+       |            else static assert(false, "Cannot implicitly convert "~T.stringof~" into an AnsiColour.");
+       |            
+     52|            return this;
+       |        }
+       |
+       |        /// Returns: The `AnsiColourType` of this `AnsiColour`.
+       |        @property
+       |        AnsiColourType type() const
+       |        {
+    133|            return this._type;
+       |        }
+       |
+       |        /// Returns: Whether this `AnsiColour` is for a background or not (it affects the output!).
+       |        @property
+       |        IsBgColour isBg() const
+       |        {
+     32|            return this._isBg;
+       |        }
+       |
+       |        /// ditto
+       |        @property
+       |        void isBg(IsBgColour bg)
+       |        {
+     71|            this._isBg = bg;
+       |        }
+       |
+       |        /// ditto
+       |        @property
+       |        void isBg(bool bg)
+       |        {
+0000000|            this._isBg = cast(IsBgColour)bg;
+       |        }
+       |
+       |        /++
+       |        + Assertions:
+       |        +  This colour's type must be `AnsiColourType.fourBit`
+       |        +
+       |        + Returns:
+       |        +  This `AnsiColour` as an `Ansi4BitColour`.
+       |        + ++/
+       |        @property
+       |        Ansi4BitColour asFourBit() const
+       |        {
+0000000|            assert(this.type == AnsiColourType.fourBit);
+0000000|            return this._value.fourBit;
+       |        }
+       |
+       |        /++
+       |        + Assertions:
+       |        +  This colour's type must be `AnsiColourType.eightBit`
+       |        +
+       |        + Returns:
+       |        +  This `AnsiColour` as a `ubyte`.
+       |        + ++/
+       |        @property
+       |        ubyte asEightBit() const
+       |        {
+0000000|            assert(this.type == AnsiColourType.eightBit);
+0000000|            return this._value.eightBit;
+       |        }
+       |
+       |        /++
+       |        + Assertions:
+       |        +  This colour's type must be `AnsiColourType.rgb`
+       |        +
+       |        + Returns:
+       |        +  This `AnsiColour` as an `AnsiRgbColour`.
+       |        + ++/
+       |        @property
+       |        AnsiRgbColour asRgb() const
+       |        {
+0000000|            assert(this.type == AnsiColourType.rgb);
+0000000|            return this._value.rgb;
+       |        }
+       |    }
+       |    
+       |    /+++ OUTPUT +++/
+       |
+       |    static if(!BetterC)
+       |    {
+       |        /++
+       |         + [Not enabled in -betterC] Converts this `AnsiColour` into a GC-allocated sequence string.
+       |         +
+       |         + See_Also:
+       |         +  `toSequence`
+       |         + ++/
+       |        @trusted nothrow
+       |        string toString() const
+       |        {
+       |            import std.exception : assumeUnique;
+       |
+      1|            auto chars = new char[MAX_CHARS_NEEDED];
+      1|            return this.toSequence(chars[0..MAX_CHARS_NEEDED]).assumeUnique;
+       |        }
+       |        ///
+       |        @("AnsiColour.toString")
+       |        unittest
+       |        {
+      1|            assert(AnsiColour(255, 128, 64).toString() == "38;2;255;128;64");
+       |        }
+       |    }
+       |
+       |    /++
+       |     + Creates an ANSI SGR command that either sets the foreground, or the background (`isBg`) to the colour
+       |     + stored inside of this `AnsiColour`.
+       |     +
+       |     + Please note that the CSI (`ANSI_CSI`/`\033[`) and the SGR marker (`ANSI_COLOUR_END`/`m`) are not included
+       |     + in this output.
+       |     +
+       |     + Notes:
+       |     +  Any characters inside of `buffer` that are not covered by the returned slice, are left unmodified.
+       |     +
+       |     +  If this colour hasn't been initialised or assigned a value, then the returned value is simply `null`.
+       |     +
+       |     + Params:
+       |     +  buffer = The statically allocated buffer used to store the result of this function.
+       |     +
+       |     + Returns:
+       |     +  A slice into `buffer` that contains the output of this function.
+       |     + ++/
+       |    @safe @nogc
+       |    char[] toSequence(ref return char[MAX_CHARS_NEEDED] buffer) nothrow const
+       |    {
+     69|        if(this.type == AnsiColourType.none)
+     37|            return null;
+       |
+     32|        size_t cursor;
+       |
+       |        void numIntoBuffer(ubyte num)
+       |        {
+     60|            char[3] text;
+     60|            const slice = numToStrBase10(text[0..3], num);
+     60|            buffer[cursor..cursor + slice.length] = slice[];
+     60|            cursor += slice.length;
+       |        }
+       |
+     32|        if(this.type != AnsiColourType.fourBit)
+       |        {
+       |            // 38; or 48;
+     20|            auto marker = (this.isBg) ? BG_MARKER : FG_MARKER;
+     20|            buffer[cursor..cursor+2] = marker[0..$];
+     20|            cursor += 2;
+     20|            buffer[cursor++] = ANSI_SEPARATOR;
+       |        }
+       |
+       |        // 4bit, 5;8bit, or 2;r;g;b
+     32|        final switch(this.type) with(AnsiColourType)
+       |        {
+       |            case none: assert(false);
+     12|            case fourBit: 
+     12|                numIntoBuffer(cast(ubyte)((this.isBg) ? this._value.fourBit + 10 : this._value.fourBit)); 
+     12|                break;
+       |
+      6|            case eightBit:
+      6|                buffer[cursor++] = EIGHT_BIT_MARKER;
+      6|                buffer[cursor++] = ANSI_SEPARATOR;
+      6|                numIntoBuffer(this._value.eightBit);
+      6|                break;
+       |                
+     14|            case rgb:
+     14|                buffer[cursor++] = RGB_MARKER;
+     14|                buffer[cursor++] = ANSI_SEPARATOR;
+       |
+     14|                numIntoBuffer(this._value.rgb.r); 
+     14|                buffer[cursor++] = ANSI_SEPARATOR;
+     14|                numIntoBuffer(this._value.rgb.g); 
+     14|                buffer[cursor++] = ANSI_SEPARATOR;
+     14|                numIntoBuffer(this._value.rgb.b); 
+     14|                break;
+       |        }
+       |
+     32|        return buffer[0..cursor];
+       |    }
+       |    ///
+       |    @("AnsiColour.toSequence(char[])")
+       |    unittest
+       |    {
+      1|        char[AnsiColour.MAX_CHARS_NEEDED] buffer;
+       |
+       |        void test(string expected, AnsiColour colour)
+       |        {
+      6|            const slice = colour.toSequence(buffer);
+      6|            assert(slice == expected);
+       |        }
+       |
+      1|        test("32",               AnsiColour(Ansi4BitColour.green));
+      1|        test("42",               AnsiColour(Ansi4BitColour.green, IsBgColour.yes));
+      1|        test("38;5;1",           AnsiColour(Ansi8BitColour(1)));
+      1|        test("48;5;1",           AnsiColour(Ansi8BitColour(1), IsBgColour.yes));
+      1|        test("38;2;255;255;255", AnsiColour(255, 255, 255));
+      1|        test("48;2;255;128;64",  AnsiColour(255, 128, 64, IsBgColour.yes));
+       |    }
+       |}
+       |
+       |/+++ MISC TYPES +++/
+       |
+       |/++
+       | + A list of styling options provided by ANSI SGR.
+       | +
+       | + As a general rule of thumb, assume most of these won't work inside of a Windows command prompt (unless it's the new Windows Terminal).
+       | + ++/
+       |enum AnsiSgrStyle
+       |{
+       |    none      = 0,
+       |    bold      = 1,
+       |    dim       = 2,
+       |    italic    = 3,
+       |    underline = 4,
+       |    slowBlink = 5,
+       |    fastBlink = 6,
+       |    invert    = 7,
+       |    strike    = 9
+       |}
+       |
+       |private template getMaxSgrStyleCharCount()
+       |{
+       |    import std.traits : EnumMembers;
+       |
+       |    // Can't even use non-betterC features in CTFE, so no std.conv.to!string :(
+       |    size_t numberOfChars(int num)
+       |    {
+       |        size_t amount;
+       |
+       |        do
+       |        {
+       |            amount++;
+       |            num /= 10;
+       |        } while(num > 0);
+       |
+       |        return amount;
+       |    }
+       |
+       |    size_t calculate()
+       |    {
+       |        size_t amount;
+       |        static foreach(member; EnumMembers!AnsiSgrStyle)
+       |            amount += numberOfChars(cast(int)member) + 1; // + 1 for the semi-colon after.
+       |
+       |        return amount;
+       |    }
+       |
+       |    enum getMaxSgrStyleCharCount = calculate();
+       |}
+       |
+       |/++
+       | + Contains any number of styling options from `AnsiStyleSgr`, and provides the ability to generate
+       | + an ANSI SGR command to apply all of the selected styling options.
+       | + ++/
+       |@safe
+       |struct AnsiStyle
+       |{
+       |    /++
+       |     + The maximum amount of characters any singular `AnsiStyle` sequence may use.
+       |     +
+       |     + This is often used to create a static array to temporarily, and without allocation, store the sequence for an `AnsiStyle`.
+       |     + ++/
+       |    enum MAX_CHARS_NEEDED = getMaxSgrStyleCharCount!();
+       |
+       |    private
+       |    {
+       |        ushort _sgrBitmask; // Each set bit index corresponds to the value from `AnsiSgrStyle`.
+       |
+       |        @safe @nogc nothrow
+       |        int sgrToBit(AnsiSgrStyle style) pure const
+       |        {
+    163|            return 1 << (cast(int)style);
+       |        }
+       |
+       |        @safe @nogc nothrow
+       |        void setSgrBit(bool setOrUnset)(AnsiSgrStyle style) pure
+       |        {
+       |            static if(setOrUnset)
+     37|                this._sgrBitmask |= this.sgrToBit(style);
+       |            else
+0000000|                this._sgrBitmask &= ~this.sgrToBit(style);
+       |        }
+       |
+       |        @safe @nogc nothrow
+       |        bool getSgrBit(AnsiSgrStyle style) pure const
+       |        {
+    126|            return (this._sgrBitmask & this.sgrToBit(style)) > 0;
+       |        }
+       |    }
+       |
+       |    // Seperate functions for better documentation generation.
+       |    //
+       |    // Tedious, as this otherwise could've all been auto-generated.
+       |    /+++ SETTERS +++/
+       |    @safe @nogc nothrow pure
+       |    {
+       |        /// Removes all styling from this `AnsiStyle`.
+       |        AnsiStyle reset() return
+       |        {
+0000000|            this._sgrBitmask = 0;
+0000000|            return this;
+       |        }
+       |
+       |        /++
+       |         + Enables/Disables a certain styling option.
+       |         +
+       |         + Params:
+       |         +  style  = The styling option to enable/disable.
+       |         +  enable = If true, enable the option. If false, disable it.
+       |         +
+       |         + Returns:
+       |         +  `this` for chaining.
+       |         + ++/
+       |        AnsiStyle set(AnsiSgrStyle style, bool enable) return
+       |        {
+     20|            if(enable)
+     20|                this.setSgrBit!true(style);
+       |            else
+0000000|                this.setSgrBit!false(style);
+     20|            return this;
+       |        }
+       |
+       |        ///
+     14|        AnsiStyle bold(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.bold); return this; }
+       |        ///
+      2|        AnsiStyle dim(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.dim); return this; }
+       |        ///
+      4|        AnsiStyle italic(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.italic); return this; }
+       |        ///
+     12|        AnsiStyle underline(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.underline); return this; }
+       |        ///
+      2|        AnsiStyle slowBlink(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.slowBlink); return this; }
+       |        ///
+0000000|        AnsiStyle fastBlink(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.fastBlink); return this; }
+       |        ///
+0000000|        AnsiStyle invert(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.invert); return this; }
+       |        ///
+0000000|        AnsiStyle strike(bool enable = true) return { this.setSgrBit!true(AnsiSgrStyle.strike); return this; }
+       |    }
+       |
+       |    /+++ GETTERS +++/
+       |    @safe @nogc nothrow pure const
+       |    {
+       |        /++
+       |         + Get the status of a certain styling option.
+       |         +
+       |         + Params:
+       |         +  style = The styling option to get.
+       |         +
+       |         + Returns:
+       |         +  `true` if the styling option is enabled, `false` otherwise.
+       |         + ++/
+       |        bool get(AnsiSgrStyle style)
+       |        {
+0000000|            return this.getSgrBit(style);
+       |        }
+       |        
+       |        ///
+0000000|        bool bold() { return this.getSgrBit(AnsiSgrStyle.bold); }
+       |        ///
+0000000|        bool dim() { return this.getSgrBit(AnsiSgrStyle.dim); }
+       |        ///
+0000000|        bool italic() { return this.getSgrBit(AnsiSgrStyle.italic); }
+       |        ///
+0000000|        bool underline() { return this.getSgrBit(AnsiSgrStyle.underline); }
+       |        ///
+0000000|        bool slowBlink() { return this.getSgrBit(AnsiSgrStyle.slowBlink); }
+       |        ///
+0000000|        bool fastBlink() { return this.getSgrBit(AnsiSgrStyle.fastBlink); }
+       |        ///
+0000000|        bool invert() { return this.getSgrBit(AnsiSgrStyle.invert); }
+       |        ///
+0000000|        bool strike() { return this.getSgrBit(AnsiSgrStyle.strike); }
+       |    }
+       |
+       |    /+++ OUTPUT +++/
+       |
+       |    static if(!BetterC)
+       |    {
+       |        /++
+       |         + [Not enabled in -betterC] Converts this `AnsiStyle` into a GC-allocated sequence string.
+       |         +
+       |         + See_Also:
+       |         +  `toSequence`
+       |         + ++/
+       |        @trusted nothrow
+       |        string toString() const
+       |        {
+       |            import std.exception : assumeUnique;
+       |
+0000000|            auto chars = new char[MAX_CHARS_NEEDED];
+0000000|            return this.toSequence(chars[0..MAX_CHARS_NEEDED]).assumeUnique;
+       |        }
+       |    }
+       |
+       |    /++
+       |     + Creates an ANSI SGR command that enables all of the desired styling options, while leaving all of the other options unchanged.
+       |     +
+       |     + Please note that the CSI (`ANSI_CSI`/`\033[`) and the SGR marker (`ANSI_COLOUR_END`/`m`) are not included
+       |     + in this output.
+       |     +
+       |     + Notes:
+       |     +  Any characters inside of `buffer` that are not covered by the returned slice, are left unmodified.
+       |     +
+       |     +  If this colour hasn't been initialised or assigned a value, then the returned value is simply `null`.
+       |     +
+       |     + Params:
+       |     +  buffer = The statically allocated buffer used to store the result of this function.
+       |     +
+       |     + Returns:
+       |     +  A slice into `buffer` that contains the output of this function.
+       |     + ++/
+       |    @safe @nogc
+       |    char[] toSequence(ref return char[MAX_CHARS_NEEDED] buffer) nothrow const
+       |    {
+       |        import std.traits : EnumMembers;
+       |
+     33|        if(this._sgrBitmask == 0)
+     19|            return null;
+       |
+     14|        size_t cursor;
+       |        void numIntoBuffer(uint num)
+       |        {
+     23|            char[10] text;
+     23|            const slice = numToStrBase10(text[0..$], num);
+     23|            buffer[cursor..cursor + slice.length] = slice[];
+     23|            cursor += slice.length;
+       |        }
+       |
+     14|        bool isFirstValue = true;
+       |        static foreach(flag; EnumMembers!AnsiSgrStyle)
+       |        {{
+    126|            if(this.getSgrBit(flag))
+       |            {
+     23|                if(!isFirstValue)
+      9|                    buffer[cursor++] = ANSI_SEPARATOR;
+     23|                isFirstValue = false;
+       |
+     23|                numIntoBuffer(cast(uint)flag);
+       |            }
+       |        }}
+       |
+     14|        return buffer[0..cursor];
+       |    }
+       |    ///
+       |    @("AnsiStyle.toSequence(char[])")
+       |    unittest
+       |    {
+       |        static if(!BetterC)
+       |        {
+      1|            char[AnsiStyle.MAX_CHARS_NEEDED] buffer;
+       |            
+       |            void test(string expected, AnsiStyle style)
+       |            {
+      2|                const slice = style.toSequence(buffer);
+      2|                assert(slice == expected, "Got '"~slice~"' wanted '"~expected~"'");
+       |            }
+       |
+      1|            test("", AnsiStyle.init);
+      1|            test("1;2;3", AnsiStyle.init.bold.dim.italic);
+       |        }
+       |    }
+       |}
+       |
+       |/+++ DATA WITH COLOUR TYPES +++/
+       |
+       |/++
+       | + Contains an `AnsiColour` for the foreground, an `AnsiColour` for the background, and an `AnsiStyle` for additional styling,
+       | + and provides the ability to create an ANSI SGR command to set the foreground, background, and overall styling of the terminal.
+       | +
+       | + A.k.a This is just a container over two `AnsiColour`s and an `AnsiStyle`.
+       | + ++/
+       |@safe
+       |struct AnsiStyleSet
+       |{
+       |    /++
+       |     + The maximum amount of characters any singular `AnsiStyle` sequence may use.
+       |     +
+       |     + This is often used to create a static array to temporarily, and without allocation, store the sequence for an `AnsiStyle`.
+       |     + ++/
+       |    enum MAX_CHARS_NEEDED = (AnsiColour.MAX_CHARS_NEEDED * 2) + AnsiStyle.MAX_CHARS_NEEDED;
+       |
+       |    private AnsiColour _fg;
+       |    private AnsiColour _bg;
+       |    private AnsiStyle _style;
+       |
+       |    // As usual, functions are manually made for better documentation.
+       |
+       |    /+++ SETTERS +++/
+       |    @safe @nogc nothrow
+       |    {
+       |        ///
+     75|        AnsiStyleSet fg(AnsiColour colour) return { this._fg = colour; this._fg.isBg = IsBgColour.no; return this; }
+       |        ///
+      7|        AnsiStyleSet fg(Ansi4BitColour colour) return { return this.fg(AnsiColour(colour)); }
+       |        ///
+      4|        AnsiStyleSet fg(Ansi8BitColour colour) return { return this.fg(AnsiColour(colour)); }
+       |        ///
+      4|        AnsiStyleSet fg(AnsiRgbColour colour) return { return this.fg(AnsiColour(colour)); }
+       |
+       |        ///
+     75|        AnsiStyleSet bg(AnsiColour colour) return { this._bg = colour; this._bg.isBg = IsBgColour.yes; return this; }
+       |        ///
+      6|        AnsiStyleSet bg(Ansi4BitColour colour) return { return this.bg(AnsiColour(colour)); }
+       |        ///
+      4|        AnsiStyleSet bg(Ansi8BitColour colour) return { return this.bg(AnsiColour(colour)); }
+       |        ///
+      5|        AnsiStyleSet bg(AnsiRgbColour colour) return { return this.bg(AnsiColour(colour)); }
+       |        ///
+       |
+       |        ///
+     64|        AnsiStyleSet style(AnsiStyle style) return { this._style = style; return this; }
+       |    }
+       |
+       |    /+++ GETTERS +++/
+       |    @safe @nogc nothrow const
+       |    {
+       |        ///
+      1|        AnsiColour fg() { return this._fg; }
+       |        ///
+      1|        AnsiColour bg() { return this._bg; }
+       |        ///
+     43|        AnsiStyle style() { return this._style; }
+       |    }
+       |
+       |    /+++ OUTPUT ++/
+       |    /++
+       |     + Creates an ANSI SGR command that sets the foreground colour, sets the background colour,
+       |     + and enables all of the desired styling options, while leaving all of the other options unchanged.
+       |     +
+       |     + Please note that the CSI (`ANSI_CSI`/`\033[`) and the SGR marker (`ANSI_COLOUR_END`/`m`) are not included
+       |     + in this output.
+       |     +
+       |     + Notes:
+       |     +  Any characters inside of `buffer` that are not covered by the returned slice, are left unmodified.
+       |     +
+       |     +  If this colour hasn't been initialised or assigned a value, then the returned value is simply `null`.
+       |     +
+       |     + Params:
+       |     +  buffer = The statically allocated buffer used to store the result of this function.
+       |     +
+       |     + Returns:
+       |     +  A slice into `buffer` that contains the output of this function.
+       |     + ++/
+       |    @safe @nogc
+       |    char[] toSequence(ref return char[MAX_CHARS_NEEDED] buffer) nothrow const
+       |    {
+     31|        size_t cursor;
+       |
+     31|        char[AnsiColour.MAX_CHARS_NEEDED] colour;
+     31|        char[AnsiStyle.MAX_CHARS_NEEDED] style;
+       |
+     31|        auto slice = this._fg.toSequence(colour);
+     31|        buffer[cursor..cursor + slice.length] = slice[];
+     31|        cursor += slice.length;
+       |
+     31|        slice = this._bg.toSequence(colour);
+     42|        if(slice.length > 0 && cursor > 0)
+      7|            buffer[cursor++] = ANSI_SEPARATOR;
+     31|        buffer[cursor..cursor + slice.length] = slice[];
+     31|        cursor += slice.length;
+       |
+     31|        slice = this.style.toSequence(style);
+     44|        if(slice.length > 0 && cursor > 0)
+      4|            buffer[cursor++] = ANSI_SEPARATOR;
+     31|        buffer[cursor..cursor + slice.length] = slice[];
+     31|        cursor += slice.length;
+       |
+     31|        return buffer[0..cursor];
+       |    }
+       |    ///
+       |    @("AnsiStyleSet.toSequence")
+       |    unittest
+       |    {
+      1|        char[AnsiStyleSet.MAX_CHARS_NEEDED] buffer;
+       |
+       |        void test(string expected, AnsiStyleSet ch)
+       |        {
+      2|            auto slice = ch.toSequence(buffer);
+      2|            assert(slice == expected, "Got '"~slice~"' expected '"~expected~"'");
+       |        }
+       |
+      1|        test("", AnsiStyleSet.init);
+      1|        test(
+       |            "32;48;2;255;128;64;1;4", 
+       |            AnsiStyleSet.init
+       |                    .fg(Ansi4BitColour.green)
+       |                    .bg(AnsiRgbColour(255, 128, 64))
+       |                    .style(AnsiStyle.init.bold.underline)
+       |        );
+       |    }
+       |}
+       |
+       |/++
+       | + An enumeration used by an `AnsiText` implementation to describe any special features that `AnsiText` needs to mold
+       | + itself around.
+       | + ++/
+       |enum AnsiTextImplementationFeatures
+       |{
+       |    /// Supports at least `.put`, `.toSink`, `char[] .newSlice`, and allows `AnsiText` to handle the encoding.
+       |    basic = 0, 
+       |}
+       |
+       |/++
+       | + A lightweight alternative to `AnsiText` which only supports a singular coloured string, at the cost
+       | + of removing most of the other complexity & dynamic allocation needs of `AnsiText`.
+       | +
+       | + If you only need to style your string in one certain way, or want to avoid `AnsiText` altogether, then this struct
+       | + is the way to go.
+       | +
+       | + Usage_(Manually):
+       | +  First, retrieve and the ANSI styling sequence via `AnsiTextLite.toFullStartSequence` and output it.
+       | +
+       | +  Second, output `AnsiTextLite.text`.
+       | +
+       | +  Finally, and optionally, retrieve the ANSI reset sequence via `AnsiTextLite.toFullEndSequence` and output it.
+       | +
+       | + Usage_(Range):
+       | +  Call `AnsiTextLite.toRange` to get the range, please read its documentation as it is important (it'll return slices to stack-allocated memory).
+       | +
+       | + Usage_(GC):
+       | +  If you're not compiling under `-betterc`, then `AnsiTextLite.toString()` will provide you with a GC-allocated string containing:
+       | +  the start ANSI sequence; the text to display; and the end ANSI sequence. i.e. A string that is just ready to be printed.
+       | +
+       | +  This struct also implements the sink-based version of `toString`, which means that when used directly with things like `writeln`, this struct
+       | +  is able to avoid allocations (unless the sink itself allocates). See the unittest for an example.
+       | +
+       | + See_Also:
+       | +  `ansi` for fluent creation of an `AnsiTextLite`.
+       | +
+       | +  This struct's unittest for an example of usage.
+       | + ++/
+       |struct AnsiTextLite
+       |{
+       |    /++
+       |     + The maximum amount of chars required by the start sequence of an `AnsiTextLite` (`toFullStartSequence`).
+       |     + ++/
+       |    enum MAX_CHARS_NEEDED = AnsiStyleSet.MAX_CHARS_NEEDED + ANSI_CSI.length + 1; // + 1 for the ANSI_COLOUR_END
+       |
+       |    /// The text to output.
+       |    const(char)[] text;
+       |    
+       |    /// The styling to apply to the text.
+       |    AnsiStyleSet styleSet;
+       |
+       |    /+++ SETTERS +++/
+       |    // TODO: Should probably make a mixin template for this, but I need to see how the documentation generators handle that.
+       |    //       I also can't just do an `alias this`, as otherwise the style functions wouldn't return `AnsiTextLite`, but instead `AnsiStyleSet`.
+       |    //       Or just suck it up and make some of the setters templatised, much to the dismay of documentation.
+       |    @safe @nogc nothrow
+       |    {
+       |        ///
+      3|        AnsiTextLite fg(AnsiColour colour) return { this.styleSet.fg = colour; this.styleSet.fg.isBg = IsBgColour.no; return this; }
+       |        ///
+      1|        AnsiTextLite fg(Ansi4BitColour colour) return { return this.fg(AnsiColour(colour)); }
+       |        ///
+0000000|        AnsiTextLite fg(Ansi8BitColour colour) return { return this.fg(AnsiColour(colour)); }
+       |        ///
+0000000|        AnsiTextLite fg(AnsiRgbColour colour) return { return this.fg(AnsiColour(colour)); }
+       |
+       |        ///
+      3|        AnsiTextLite bg(AnsiColour colour) return { this.styleSet.bg = colour; this.styleSet.bg.isBg = IsBgColour.yes; return this; }
+       |        ///
+0000000|        AnsiTextLite bg(Ansi4BitColour colour) return { return this.bg(AnsiColour(colour)); }
+       |        ///
+0000000|        AnsiTextLite bg(Ansi8BitColour colour) return { return this.bg(AnsiColour(colour)); }
+       |        ///
+      1|        AnsiTextLite bg(AnsiRgbColour colour) return { return this.bg(AnsiColour(colour)); }
+       |        ///
+       |
+       |        ///
+      2|        AnsiTextLite style(AnsiStyle style) return { this.styleSet.style = style; return this; }
+       |    }
+       |
+       |    /+++ GETTERS +++/
+       |    @safe @nogc nothrow const
+       |    {
+       |        ///
+0000000|        AnsiColour fg() { return this.styleSet.fg; }
+       |        ///
+0000000|        AnsiColour bg() { return this.styleSet.bg; }
+       |        ///
+0000000|        AnsiStyle style() { return this.styleSet.style; }
+       |    }
+       |
+       |    @safe @nogc nothrow const
+       |    {
+       |        /++
+       |         + Populates the given buffer with the full ANSI sequence needed to enable the styling
+       |         + defined within this `AnsiTextLite`
+       |         +
+       |         + Unlike the usual `toSequence` functions, this function includes the `ANSI_CSI` and `ANSI_COLOUR_END` markers,
+       |         + meaning the output from this function is ready to be printed as-is.
+       |         +
+       |         + Do note that this function doesn't insert a null-terminator, so if you're using anything based on C strings, you need
+       |         + to insert that yourself.
+       |         +
+       |         + Notes:
+       |         +  Any parts of the `buffer` that are not populated by this function are left untouched.
+       |         +
+       |         + Params:
+       |         +  buffer = The buffer to populate.
+       |         +
+       |         + Returns:
+       |         +  The slice of `buffer` that has been populated.
+       |         + ++/
+       |        char[] toFullStartSequence(ref return char[MAX_CHARS_NEEDED] buffer)
+       |        {
+0000000|            size_t cursor;
+       |
+0000000|            buffer[0..ANSI_CSI.length] = ANSI_CSI[];
+0000000|            cursor += ANSI_CSI.length;
+       |
+0000000|            char[AnsiStyleSet.MAX_CHARS_NEEDED] styleBuffer;
+0000000|            const styleSlice = this.styleSet.toSequence(styleBuffer);
+0000000|            buffer[cursor..cursor+styleSlice.length] = styleSlice[];
+0000000|            cursor += styleSlice.length;
+       |
+0000000|            buffer[cursor++] = ANSI_COLOUR_END;
+       |
+0000000|            return buffer[0..cursor];
+       |        }
+       |
+       |        /++
+       |         + Returns:
+       |         +  The end ANSI sequence for `AnsiTextLite`, which is simply a statically allocated version of the `ANSI_COLOUR_RESET` constant.
+       |         + ++/
+       |        char[ANSI_COLOUR_RESET.length] toFullEndSequence()
+       |        {
+0000000|            typeof(return) buffer;
+0000000|            buffer[0..$] = ANSI_COLOUR_RESET[];
+0000000|            return buffer;
+       |        }
+       |
+       |        /++
+       |         + Provides a range that returns, in this order: The start sequence (`.toFullStartSequence`); the output text (`.text`),
+       |         + and finally the end sequence (`.toFullEndSequence`).
+       |         +
+       |         + This range is $(B weakly-safe) as it $(B returns slices to stack memory) so please ensure that $(B any returned slices don't outlive the origin range object).
+       |         +
+       |         + Please also note that non of the returned slices contain null terminators.
+       |         +
+       |         + Returns:
+       |         +  An Input Range that returns all the slices required to correctly display this `AnsiTextLite` onto a console.
+       |         + ++/
+       |        auto toRange()
+       |        {
+       |            static struct Range
+       |            {
+       |                char[MAX_CHARS_NEEDED] start;
+       |                const(char)[] middle;
+       |                char[ANSI_COLOUR_RESET.length] end;
+       |                char[] startSlice;
+       |
+       |                size_t sliceCount;
+       |
+       |                @safe @nogc nothrow:
+       |
+       |                bool empty()
+       |                {
+0000000|                    return this.sliceCount >= 3;
+       |                }
+       |
+       |                void popFront()
+       |                {
+0000000|                    this.sliceCount++;
+       |                }
+       |
+       |                @trusted
+       |                const(char)[] front() return
+       |                {
+0000000|                    switch(sliceCount)
+       |                    {
+0000000|                        case 0: return this.startSlice;
+0000000|                        case 1: return this.middle;
+0000000|                        case 2: return this.end[0..$];
+       |                        default: assert(false, "Cannot use empty range.");
+       |                    }   
+       |                }
+       |            }
+       |
+0000000|            Range r;
+0000000|            r.startSlice = this.toFullStartSequence(r.start);
+0000000|            r.middle = this.text;
+0000000|            r.end = this.toFullEndSequence();
+       |
+0000000|            return r;
+       |        }
+       |    }
+       |
+       |    static if(!BetterC)
+       |    /++
+       |     + Notes:
+       |     +  This struct implements the sink-based `toString` which performs no allocations, so the likes of `std.stdio.writeln` will
+       |     +  automatically use the sink-based version if you pass this struct to it directly.
+       |     +
+       |     + Returns: 
+       |     +  A GC-allocated string containing this `AnsiTextLite` as an ANSI-encoded string, ready for printing.
+       |     + ++/
+       |    @trusted nothrow // @trusted due to .assumeUnique
+       |    string toString() const
+       |    {
+       |        import std.exception : assumeUnique;
+       |
+0000000|        char[MAX_CHARS_NEEDED] styleBuffer;
+0000000|        const styleSlice = this.toFullStartSequence(styleBuffer);
+       |
+0000000|        auto buffer = new char[styleSlice.length + this.text.length + ANSI_COLOUR_RESET.length];
+0000000|        buffer[0..styleSlice.length]                                  = styleSlice[];
+0000000|        buffer[styleSlice.length..styleSlice.length+this.text.length] = this.text[];
+0000000|        buffer[$-ANSI_COLOUR_RESET.length..$]                         = ANSI_COLOUR_RESET[];
+       |
+0000000|        return buffer.assumeUnique;
+       |    }
+       |
+       |    /++
+       |     + The sink-based version of `toString`, which doesn't allocate by itself unless the `sink` decides to allocate.
+       |     +
+       |     + Params:
+       |     +  sink = The sink to output into.
+       |     +
+       |     + See_Also:
+       |     +  `toSink` for a templatised version of this function which can infer attributes, and supports any form of Output Range instead of just a delegate.
+       |     + ++/
+       |    void toString(scope void delegate(const(char)[]) sink) const
+       |    {
+0000000|        foreach(slice; this.toRange())
+0000000|            sink(slice);
+       |    }
+       |
+       |    /++
+       |     + Outputs in order: The start sequence (`.toFullStartSequence`), the output text (`.text`), and the end sequence (`.toFullEndSequence`)
+       |     + into the given `sink`.
+       |     +
+       |     + This function by itself does not allocate memory.
+       |     +
+       |     + This function will infer attributes, so as to be used in whatever attribute-souped environment your sink supports.
+       |     +
+       |     + $(B Please read the warnings described in `.toRange`) TLDR; don't persist the slices given to the sink under any circumstance. You must
+       |     + copy the data as soon as you get it.
+       |     +
+       |     + Params:
+       |     +  sink = The sink to output into.
+       |     + ++/
+       |    void toSink(Sink)(scope ref Sink sink) const
+       |    {
+       |        foreach(slice; this.toRange())
+       |            sink.put(slice);
+       |    }
+       |}
+       |///
+       |@("AnsiTextLite")
+       |unittest
+       |{
+       |    static if(!BetterC)
+       |    {
+      1|        auto text = "Hello!".ansi
+       |                            .fg(Ansi4BitColour.green)
+       |                            .bg(AnsiRgbColour(128, 128, 128))
+       |                            .style(AnsiStyle.init.bold.underline);
+       |
+       |        // Usage 1: Manually
+       |        import core.stdc.stdio : printf;
+       |        import std.stdio : writeln, write;
+       |        version(JANSI_TestOutput) // Just so test output isn't clogged. This still shows you how to use things though.
+       |        {
+       |            char[AnsiTextLite.MAX_CHARS_NEEDED + 1] startSequence; // + 1 for null terminator.
+       |            const sliceFromStartSequence = text.toFullStartSequence(startSequence[0..AnsiTextLite.MAX_CHARS_NEEDED]);
+       |            startSequence[sliceFromStartSequence.length] = '\0';
+       |
+       |            char[200] textBuffer;
+       |            textBuffer[0..text.text.length] = text.text[];
+       |            textBuffer[text.text.length] = '\0';
+       |
+       |            char[ANSI_COLOUR_RESET.length + 1] endSequence;
+       |            endSequence[0..ANSI_COLOUR_RESET.length] = text.toFullEndSequence()[];
+       |            endSequence[$-1] = '\0';
+       |
+       |            printf("%s%s%s\n", startSequence.ptr, textBuffer.ptr, endSequence.ptr);
+       |        }
+       |
+       |        // Usage 2: Range (RETURNS STACK MEMORY, DO NOT ALLOW SLICES TO OUTLIVE RANGE OBJECT WITHOUT EXPLICIT COPY)
+       |        version(JANSI_TestOutput)
+       |        {
+       |            // -betterC
+       |            foreach(slice; text.toRange)
+       |            {
+       |                char[200] buffer;
+       |                buffer[0..slice.length] = slice[];
+       |                buffer[slice.length] = '\0';
+       |                printf("%s", buffer.ptr);
+       |            }
+       |            printf("\n");
+       |
+       |            // GC
+       |            foreach(slice; text.toRange)
+       |                write(slice);
+       |            writeln();
+       |        }
+       |        
+       |        // Usage 3: toString (Sink-based, so AnsiTextLite doesn't allocate, but writeln/the sink might)
+       |        version(JANSI_TestOutput)
+       |        {
+       |            writeln(text); // Calls the sink-based .toString();
+       |        }
+       |
+       |        // Usage 4: toString (non-sink, non-betterc only)
+       |        version(JANSI_TestOutput)
+       |        {
+       |            writeln(text.toString());
+       |        }
+       |
+       |        // Usage 5: toSink
+       |        version(JANSI_TestOutput)
+       |        {
+       |            struct CustomOutputRange
+       |            {
+       |                char[] output;
+       |                @safe
+       |                void put(const(char)[] slice) nothrow
+       |                {
+       |                    const start = output.length;
+       |                    output.length += slice.length;
+       |                    output[start..$] = slice[];
+       |                }
+       |            }
+       |
+       |            CustomOutputRange sink;
+       |            ()@safe nothrow{ text.toSink(sink); }();
+       |            
+       |            writeln(sink.output);
+       |        }
+       |    }
+       |}
+       |
+       |/++
+       | + Contains a string that supports the ability for different parts of the string to be styled seperately.
+       | +
+       | + This struct is highly flexible and dynamic, as it requires the use of external code to provide some
+       | + of the implementation.
+       | +
+       | + Because this is provided via a `mixin template`, implementations can also $(B extend) this struct to 
+       | + provide their own functionality, make things non-copyable if needed, allows data to be stored via ref-counting, etc.
+       | +
+       | + This struct itself is mostly just a consistant user-facing interface that all implementations share, while the implementations
+       | + themselves can transform this struct to any level it requires.
+       | +
+       | + Implementations_:
+       | +  While implementations can add whatever functions, operator overloads, constructors, etc. that they want, there is a small
+       | +  set of functions and value that each implmentation must define in order to be useable.
+       | +
+       | +  Every implementation must define an enum called `Features` who's value is one of the values of `AnsiTextImplementationFeatures`.
+       | +  For example: `enum Features = AnsiTextImplementationFeatures.xxx`
+       | +
+       | +  Builtin implementations consist of `AnsiTextGC` (not enabled with -betterC), `AnsiTextStack`, and `AnsiTextMalloc`, which are self-descriptive.
+       | +
+       | + Basic_Implemetations:
+       | +  An implementation that doesn't require anything noteworthy from `AnsiText` itself should define their features as `AnsiTextImplementationFeatures.basic`.
+       | +
+       | +  This type of implementation must implement the following functions (expressed here as an interface for simplicity):
+       | +
+       | +  ```
+       | interface BasicImplementation
+       | {
+       |     /// Provides `AnsiText` with a slice that is of at least `minLength` in size.
+       |     ///
+       |     /// This function is called `AnsiText` needs to insert more styled characters into the string.
+       |     ///
+       |     /// How this slice is stored and allocated and whatever else, is completely down to the implementation.
+       |     /// Remember that because you're a mixin template, you can use referencing counting, disable the copy ctor, etc!
+       |     ///
+       |     /// The slice will never be escaped by `AnsiText` itself, and will not be stored beyond a single function call.
+       |     char[] newSlice(size_t minLength);
+       |
+       |     /// Outputs the styled string into the provided sink.
+       |     ///
+       |     /// Typically this is an OutputRange that can handle `char[]`s, but it can really be whatever the implementation wants to support.
+       |     void toSink(Sink)(Sink sink);
+       |
+       |     static if(NotCompilingUnderBetterC && ImplementationDoesntDefineToString)
+       |     final string toString()
+       |     {
+       |         // Autogenerated GC-based implementation provided by `AnsiText`.
+       |         //
+       |         // For implementations where this can be generated, it just makes them a little easier for the user
+       |         // to use with things like `writeln`.
+       |         //
+       |         // The `static if` shows the conditions for this to happen.
+       |     }
+       | }
+       | +  ```
+       | + ++/
+       |struct AnsiText(alias ImplementationMixin)
+       |{
+       |    mixin ImplementationMixin;
+       |    alias ___TEST = TestAnsiTextImpl!(typeof(this));
+       |
+       |    void put()(const(char)[] text, AnsiColour fg = AnsiColour.init, AnsiColour bg = AnsiColour.bgInit, AnsiStyle style = AnsiStyle.init)
+       |    {
+      9|        fg.isBg = IsBgColour.no;
+      9|        bg.isBg = IsBgColour.yes;
+       |
+      9|        char[AnsiStyleSet.MAX_CHARS_NEEDED] sequence;
+      9|        auto sequenceSlice = AnsiStyleSet.init.fg(fg).bg(bg).style(style).toSequence(sequence);
+       |
+      9|        auto minLength = ANSI_CSI.length + sequenceSlice.length + /*ANSI_COLOUR_END*/1 + text.length + ((sequenceSlice.length > 0) ? 2 : 1); // Last one is for the '0' or '0;'
+      9|        char[] slice = this.newSlice(minLength);
+      9|        size_t cursor;
+       |
+       |        void appendToSlice(const(char)[] source)
+       |        {
+     36|            slice[cursor..cursor+source.length] = source[];
+     36|            cursor += source.length;
+       |        }
+       |
+      9|        appendToSlice(ANSI_CSI);
+      9|        appendToSlice("0"); // Reset all previous styling
+      9|        if(sequenceSlice.length > 0)
+      6|            slice[cursor++] = ANSI_SEPARATOR;
+      9|        appendToSlice(sequenceSlice);
+      9|        slice[cursor++] = ANSI_COLOUR_END;
+      9|        appendToSlice(text);
+       |    }
+       |
+       |    /// ditto.
+       |    void put()(const(char)[] text, AnsiStyleSet styling)
+       |    {
+       |        this.put(text, styling.fg, styling.bg, styling.style);
+       |    }
+       |
+       |    /// ditto.
+       |    void put()(AnsiTextLite text)
+       |    {
+       |        this.put(text.text, text.fg, text.bg, text.style);
+       |    }
+       |
+       |    // Generate a GC-based toString if circumstances allow.
+       |    static if(
+       |        Features == AnsiTextImplementationFeatures.basic
+       |     && !__traits(hasMember, typeof(this), "toString")
+       |     && !BetterC
+       |     && __traits(compiles, { struct S{void put(const(char)[]){}} S s; typeof(this).init.toSink(s); }) // Check if this toSink can take a char[] output range.
+       |    )
+       |    {
+       |        /++
+       |         + [Not enabled with -betterC] Provides this `AnsiText` as a printable string.
+       |         +
+       |         + If the implementation is a basic implementation (see the documentation for `AnsiText`); if the
+       |         + implementation doesn't define its own `toString`, and if we're not compliling under -betterC, then
+       |         + `AnsiText` will generate this function on behalf of the implementation.
+       |         +
+       |         + Description:
+       |         +  For basic implementations this function will call `toSink` with an `Appender!(char[])` as the sink.
+       |         +
+       |         +  For $(B this default generated) implementation of `toString`, it is a seperate GC-allocated string so is
+       |         +  fine for any usage. If an implementation defines its own `toString` then it should also document what the lifetime
+       |         +  of its returned string is.
+       |         +
+       |         + Returns:
+       |         +  This `AnsiText` as a useable string.
+       |         + ++/
+       |        string toString()()
+       |        {
+       |            import std.array : Appender;
+       |            import std.exception : assumeUnique;
+       |
+      3|            Appender!(char[]) output;
+      3|            this.toSink(output);
+       |
+      6|            return ()@trusted{return output.data.assumeUnique;}();
+       |        }
+       |
+       |        /++
+       |         + [Not enabled with -betterC] Provides the sink-based version of the autogenerated `toString`.
+       |         +
+       |         + This functions and is generated under the same conditions as the parameterless `toString`, except it
+       |         + supports the sink-based interface certain parts of Phobos recognises, helping to prevent needless allocations.
+       |         +
+       |         + This function simply wraps the given `sink` and forwards it to the implementation's `toSink` function, so there's no
+       |         + implicit GC overhead as with the other `toString`. (At least, not by `AnsiText` itself.)
+       |         + ++/
+       |        void toString(scope void delegate(const(char)[]) sink)
+       |        {
+       |            struct Sink
+       |            {
+       |                void put(const(char)[] slice)
+       |                {
+0000000|                    sink(slice);
+       |                }
+       |            }
+       |            
+0000000|            Sink s;
+0000000|            this.toSink(s);
+       |        }
+       |    }
+       |}
+       |
+       |private template TestAnsiTextImpl(alias TextT)
+       |{
+       |    // Ensures that the implementation has the required functions, and that they can be used in every required way.
+       |    static assert(__traits(hasMember, TextT, "Features"),
+       |        "Implementation must define: `enum Features = AnsiTextImplementationFeatures.xxx;`"
+       |    );
+       |
+       |    static if(TextT.Features == AnsiTextImplementationFeatures.basic)
+       |    {
+       |        static assert(__traits(hasMember, TextT, "newSlice"),
+       |            "Implementation must define: `char[] newSlice(size_t minLength)`"
+       |        );
+       |        static assert(__traits(hasMember, TextT, "toSink"),
+       |            "Implementation must define: `void toSink(Sink)(Sink sink)`"
+       |        );
+       |    }
+       |}
+       |
+       |@("AnsiText.toString - Autogenerated GC-based")
+       |unittest
+       |{
+       |    static if(!BetterC)
+       |    {
+       |        import std.format : format;
+       |
+       |        void genericTest(AnsiTextT)(auto ref AnsiTextT text)
+       |        {
+      3|            text.put("Hello, ");
+      3|            text.put("Wor", AnsiColour(1, 2, 3), AnsiColour(3, 2, 1), AnsiStyle.init.bold.underline);
+      3|            text.put("ld!", AnsiColour(Ansi4BitColour.green));
+       |
+      3|            auto str      = text.toString();
+      3|            auto expected = "\033[0mHello, \033[0;38;2;1;2;3;48;2;3;2;1;1;4mWor\033[0;32mld!\033[0m";
+       |
+      3|            assert(
+       |                str == expected, 
+       |                "Got is %s chars long. Expected is %s chars long\nGot: %s\nExp: %s".format(str.length, expected.length, [str], [expected])
+       |            );
+       |
+       |            version(JANSI_TestOutput)
+       |            {
+       |                import std.stdio, std.traits;
+       |                static if(isCopyable!AnsiTextT)
+       |                    writeln(text);
+       |            }
+       |        }
+       |
+      1|        genericTest(AnsiTextGC.init);
+      1|        genericTest(AnsiTextMalloc.init);
+      1|        genericTest(AnsiTextStack!100.init);
+       |    }
+       |}
+       |
+       |static if(!BetterC)
+       |{
+       |    // Very naive implementation just so I have something to start off with.
+       |    ///
+       |    mixin template AnsiTextGCImplementation()
+       |    {
+       |        private char[][] _slices;
+       |
+       |        enum Features = AnsiTextImplementationFeatures.basic;
+       |
+       |        @safe
+       |        char[] newSlice(size_t minLength) nothrow
+       |        {
+      3|            this._slices ~= new char[minLength];
+      3|            return this._slices[$-1];
+       |        }
+       |
+       |        void toSink(Sink)(ref scope Sink sink)
+       |        if(isOutputRange!(Sink, char[]))
+       |        {
+     12|            foreach(slice; this._slices)
+      3|                sink.put(slice);
+      1|            sink.put(ANSI_COLOUR_RESET);
+       |        }
+       |    }
+       |
+       |    /++
+       |     + A basic implementation that uses the GC for memory storage.
+       |     +
+       |     + Since the memory is GC allocated there's no real fears to note.
+       |     +
+       |     + Allows `AnsiText` to be copied, but changes between copies are not reflected between eachother. Remember to use `ref`!
+       |     + ++/
+       |    alias AnsiTextGC = AnsiText!AnsiTextGCImplementation;
+       |}
+       |
+       |///
+       |mixin template AnsiTextMallocImplementation()
+       |{
+       |    import std.experimental.allocator.mallocator, std.experimental.allocator;
+       |
+       |    enum Features = AnsiTextImplementationFeatures.basic;
+       |
+       |    // Again, very naive implementation just to get stuff to show off.
+       |    private char[][] _slices;
+       |
+       |    // Stuff like this is why I went for this very strange design decision of using user-defined mixin templates.
+       |    @disable this(this){}
+       |
+       |    @nogc
+       |    ~this() nothrow
+       |    {
+      1|        if(this._slices !is null)
+       |        {
+     12|            foreach(slice; this._slices)
+      3|                Mallocator.instance.dispose(slice);
+      1|            Mallocator.instance.dispose(this._slices);
+       |        }
+       |    }
+       |
+       |    @nogc
+       |    char[] newSlice(size_t minLength) nothrow
+       |    {
+      3|        auto slice = Mallocator.instance.makeArray!char(minLength);
+      3|        if(this._slices is null)
+      1|            this._slices = Mallocator.instance.makeArray!(char[])(1);
+       |        else
+      2|            Mallocator.instance.expandArray(this._slices, 1);
+      3|        this._slices[$-1] = slice;
+      3|        return slice;
+       |    }
+       |
+       |    void toSink(Sink)(ref scope Sink sink)
+       |    if(isOutputRange!(Sink, char[]))
+       |    {
+     12|        foreach(slice; this._slices)
+      3|            sink.put(slice);
+      1|        sink.put(ANSI_COLOUR_RESET);
+       |    }
+       |}
+       |
+       |/++
+       | + A basic implementation using `malloc` backed memory.
+       | +
+       | + This implementation disables copying for `AnsiText`, as it makes use of RAII to cleanup its resources.
+       | +
+       | + Sinks should keep in mind that they are being passed manually managed memory, so it should be considered an error
+       | + if the sink stores any provided slices outside of its `.put` function. i.e. Copy the data, don't keep it around unless you know what you're doing.
+       | + ++/
+       |alias AnsiTextMalloc = AnsiText!AnsiTextMallocImplementation;
+       |
+       |///
+       |template AnsiTextStackImplementation(size_t Capacity)
+       |{
+       |    mixin template AnsiTextStackImplementation()
+       |    {
+       |        enum Features = AnsiTextImplementationFeatures.basic;
+       |
+       |        private char[Capacity] _output;
+       |        private size_t _cursor;
+       |
+       |        // This code by itself is *technically* safe, but the way the user uses it might not be.
+       |
+       |        @safe @nogc
+       |        char[] newSlice(size_t minLength) nothrow
+       |        {
+      3|            const end = this._cursor + minLength;
+      3|            assert(end <= this._output.length, "Ran out of space.");
+       |
+      3|            auto slice = this._output[this._cursor..end];
+      3|            this._cursor = end;
+       |
+      3|            return slice;
+       |        }
+       |
+       |        void toSink(Sink)(ref Sink sink)
+       |        if(isOutputRange!(Sink, char[]))
+       |        {
+      1|            sink.put(this.asStackSlice);
+      1|            sink.put(ANSI_COLOUR_RESET);
+       |        }
+       |
+       |        @safe @nogc
+       |        char[] asStackSlice() nothrow
+       |        {
+      1|            return this._output[0..this._cursor];    
+       |        }
+       |
+       |        @safe @nogc
+       |        char[Capacity] asStackSliceCopy(ref size_t lengthInUse) nothrow
+       |        {
+0000000|            lengthInUse = this._cursor;
+0000000|            return this._output;
+       |        }
+       |    }
+       |}
+       |
+       |/++
+       | + A basic implementation using a static amount of stack memory.
+       | +
+       | + Sinks should keep in mind that they're being passed a slice to stack memory, so should not persist slices outside of their `.put` function,
+       | + they must instead make a copy of the data.
+       | +
+       | + This implementation will fail an assert if the user attempts to push more data into it than it can handle.
+       | +
+       | + Params:
+       | +  Capacity = The amount of characters to use on the stack.
+       | + ++/
+       |alias AnsiTextStack(size_t Capacity) = AnsiText!(AnsiTextStackImplementation!Capacity);
+       |
+       |/+++ READING/PARSING +++/
+       |
+       |/++
+       | + Executes the SGR sequence found in `input`, and populates the passed in `style` based on the command sequence.
+       | +
+       | + Anything directly provided by this library is supported.
+       | +
+       | + The previous state of `style` is preserved unless specifically untoggled/reset via the command sequence (e.g. `ESC[0m` to reset everything).
+       | +
+       | + If an error occurs during execution of the sequence, the given `style` is left completely unmodified.
+       | +
+       | + Params:
+       | +  input     = The slice containing the command sequence. The first character should be the start (`ANSI_CSI`) character of the sequence (`\033`), and
+       | +              characters will continue to be read until the command sequence has been finished. Any characters after the command sequence are left unread.
+       | +  style     = A reference to an `AnsiStyleSet` to populate. As mentioned, this function will only untoggle styling, or reset the style if the command sequence specifies.
+       | +              This value is left unmodified if an error is encountered.
+       | +  charsRead = This value will be set to the amount of chars read from the given `input`, so the caller knows where to continue reading from (if applicable).
+       | +              This value is populated on both error and success.
+       | +
+       | + Returns:
+       | +  Either `null` on success, or a string describing the error that was encountered.
+       | + ++/
+       |@safe @nogc
+       |string ansiExecuteSgrSequence(const(char)[] input, ref AnsiStyleSet style, out size_t charsRead) nothrow
+       |{
+       |    import std.traits : EnumMembers;
+       |
+       |    enum ReadResult { foundEndMarker, foundSemiColon, foundEnd, foundBadCharacter }
+       |
+     20|    if(input.length < 3)
+0000000|        return "A valid SGR is at least 3 characters long: ESC[m";
+       |
+     20|    if(input[0..ANSI_CSI.length] != ANSI_CSI)
+0000000|        return "Input does not start with the CSI: ESC[";
+       |
+     20|    auto styleCopy = style;
+       |
+     20|    charsRead = 2;
+       |    ReadResult readToSemiColonOrEndMarker(ref const(char)[] slice)
+       |    {
+     50|        const start = charsRead;
+    140|        while(true)
+       |        {
+    140|            if(charsRead >= input.length)
+0000000|                return ReadResult.foundEnd;
+       |
+    140|            const ch = input[charsRead];
+    140|            if(ch == 'm')
+       |            {
+     20|                slice = input[start..charsRead];
+     20|                return ReadResult.foundEndMarker;
+       |            }
+    120|            else if(ch == ';')
+       |            {
+     30|                slice = input[start..charsRead];
+     30|                return ReadResult.foundSemiColon;
+       |            }
+    180|            else if(ch >= '0' && ch <= '9')
+       |            {
+     90|                charsRead++;
+     90|                continue;
+       |            }
+       |            else
+0000000|                return ReadResult.foundBadCharacter;
+       |        }
+       |    }
+       |
+       |    int toValue(const(char)[] slice)
+       |    {
+     50|        return (slice.length == 0) ? 0 : slice.strToNum!int;
+       |    }
+       |
+       |    string resultToString(ReadResult result)
+       |    {
+0000000|        final switch(result) with(ReadResult)
+       |        {
+0000000|            case foundEnd: return "Unexpected end of input.";
+0000000|            case foundBadCharacter: return "Unexpected character in input.";
+       |
+0000000|            case foundSemiColon: return "Unexpected semi-colon.";
+0000000|            case foundEndMarker: return "Unexpected end marker ('m').";
+       |        }
+       |    }
+       |
+     20|    const(char)[] generalSlice;
+     50|    while(charsRead < input.length)
+       |    {
+     50|        const ch = input[charsRead];
+       |
+     50|        switch(ch)
+       |        {
+    161|            case '0':..case '9':
+     26|                auto result = readToSemiColonOrEndMarker(generalSlice);
+     40|                if(result != ReadResult.foundSemiColon && result != ReadResult.foundEndMarker)
+0000000|                    return resultToString(result);
+       |
+     26|                const commandAsNum = toValue(generalSlice);
+     26|                Switch: switch(commandAsNum)
+       |                {
+       |                    // Full reset
+0000000|                    case 0: styleCopy = AnsiStyleSet.init; break;
+       |
+       |                    // Basic style flag setters.
+       |                    static foreach(member; EnumMembers!AnsiSgrStyle)
+       |                    {
+       |                        static if(member != AnsiSgrStyle.none)
+       |                        {
+     12|                            case cast(int)member:
+     12|                                styleCopy.style = styleCopy.style.set(member, true);
+     12|                                break Switch;
+       |                        }
+       |                    }
+       |
+       |                    // Set foreground to a 4-bit colour.
+     12|                    case 30:..case 37:
+     22|                    case 90:..case 97:
+      3|                        styleCopy.fg = cast(Ansi4BitColour)commandAsNum;
+      3|                        break;
+       |
+       |                    // Set background to a 4-bit colour.
+      6|                    case 40:..case 47:
+     21|                    case 100:..case 107:
+      3|                        styleCopy.bg = cast(Ansi4BitColour)(commandAsNum - ANSI_FG_TO_BG_INCREMENT); // Since we work in the foreground colour until we're outputting to sequences.
+      3|                        break;
+       |                    
+       |                    // Set foreground (38) or background (48) to an 8-bit (5) or 24-bit (2) colour.
+      4|                    case 38:
+      8|                    case 48:
+      8|                        if(result == ReadResult.foundEndMarker)
+0000000|                            return "Incomplete 'set foreground/background' command, expected another parameter, got none.";
+      8|                        charsRead++; // Skip semi-colon.
+       |
+      8|                        result = readToSemiColonOrEndMarker(generalSlice);
+     16|                        if(result != ReadResult.foundEndMarker && result != ReadResult.foundSemiColon)
+0000000|                            return resultToString(result);
+      8|                        if(result == ReadResult.foundSemiColon)
+      8|                            charsRead++;
+       |
+      8|                        const subcommand = toValue(generalSlice);
+      8|                        if(subcommand == 5)
+       |                        {
+      4|                            result = readToSemiColonOrEndMarker(generalSlice);
+      5|                            if(result != ReadResult.foundEndMarker && result != ReadResult.foundSemiColon)
+0000000|                                return resultToString(result);
+      4|                            if(result == ReadResult.foundSemiColon)
+      1|                                charsRead++;
+       |
+      6|                            if(commandAsNum == 38) styleCopy.fg = cast(Ansi8BitColour)toValue(generalSlice);
+      2|                            else                   styleCopy.bg = cast(Ansi8BitColour)toValue(generalSlice);
+       |                        }
+      4|                        else if(subcommand == 2)
+       |                        {
+      4|                            ubyte[3] components;
+     48|                            foreach(i; 0..3)
+       |                            {
+     12|                                result = readToSemiColonOrEndMarker(generalSlice);
+     21|                                if(result != ReadResult.foundEndMarker && result != ReadResult.foundSemiColon)
+0000000|                                    return resultToString(result);
+     12|                                if(result == ReadResult.foundSemiColon)
+      9|                                    charsRead++;
+       |
+     12|                                components[i] = cast(ubyte)toValue(generalSlice);
+       |                            }
+       |
+      6|                            if(commandAsNum == 38) styleCopy.fg = AnsiRgbColour(components);
+      2|                            else                   styleCopy.bg = AnsiRgbColour(components);
+       |                        }
+       |                        else
+0000000|                            break; // Assume it's a valid command, just that we don't support this specific sub command.
+      8|                        break;
+       |
+0000000|                    default: continue; // Assume it's just a command we don't support.
+       |                }
+     26|                break;
+       |
+     20|            case 'm':
+     20|                charsRead++;
+     20|                style = styleCopy;
+     20|                return null;
+       |
+     12|            case ';': charsRead++; continue;
+0000000|            default: return null; // Assume we've hit an end-marker we don't support.
+       |        }
+       |    }
+       |
+0000000|    return "Input did not contain an end marker.";
+       |}
+       |///
+       |@("ansiExecuteSgrSequence")
+       |unittest
+       |{
+       |    static if(!BetterC)
+       |    {
+       |        import std.conv : to;
+       |        import std.traits : EnumMembers;
+       |
+       |        void test(AnsiStyleSet sourceAndExpected)
+       |        {
+     20|            char[AnsiStyleSet.MAX_CHARS_NEEDED] buffer;
+     20|            const sequence = ANSI_CSI~sourceAndExpected.toSequence(buffer)~ANSI_COLOUR_END;
+       |
+     20|            AnsiStyleSet got;
+     20|            size_t charsRead;
+     20|            const error = ansiExecuteSgrSequence(sequence, got, charsRead);
+     20|            if(error !is null)
+       |                assert(false, error);
+       |
+     20|            assert(charsRead == sequence.length, "Read "~charsRead.to!string~" not "~sequence.length.to!string);
+     20|            assert(sourceAndExpected == got, "Expected "~sourceAndExpected.to!string~" got "~got.to!string);
+       |        }
+       |
+      1|        test(AnsiStyleSet.init.fg(Ansi4BitColour.green));
+      1|        test(AnsiStyleSet.init.fg(Ansi4BitColour.brightGreen));
+      1|        test(AnsiStyleSet.init.bg(Ansi4BitColour.green));
+      1|        test(AnsiStyleSet.init.bg(Ansi4BitColour.brightGreen));
+      1|        test(AnsiStyleSet.init.fg(Ansi4BitColour.green).bg(Ansi4BitColour.brightRed));
+       |
+      1|        test(AnsiStyleSet.init.fg(20));
+      1|        test(AnsiStyleSet.init.bg(40));
+      1|        test(AnsiStyleSet.init.fg(20).bg(40));
+       |
+      1|        test(AnsiStyleSet.init.fg(AnsiRgbColour(255, 128, 64)));
+      1|        test(AnsiStyleSet.init.bg(AnsiRgbColour(255, 128, 64)));
+      1|        test(AnsiStyleSet.init.fg(AnsiRgbColour(255, 128, 64)).bg(AnsiRgbColour(64, 128, 255)));
+       |        
+       |        static foreach(member; EnumMembers!AnsiSgrStyle)
+       |        static if(member != AnsiSgrStyle.none)
+      8|            test(AnsiStyleSet.init.style(AnsiStyle.init.set(member, true)));
+       |
+      1|        test(AnsiStyleSet.init.style(AnsiStyle.init.bold.underline.slowBlink.italic));
+       |    }
+       |}
+       |
+       |/++
+       | + The resulting object from `AnsiSectionRange`, describes whether a slice of text is an ANSI sequence or not.
+       | + ++/
+       |struct AnsiSection
+       |{
+       |    /// `true` if the slice is an ANSI sequence, `false` if it's just text.
+       |    bool isAnsiSequence;
+       |
+       |    /// The slice of text that this section consists of.
+       |    const(char)[] slice;
+       |}
+       |
+       |/++
+       | + An input range of `AnsiSection`s that splits a piece of text up into ANSI sequence and plain text sections.
+       | +
+       | + For example, the text "\033[37mABC\033[0m" has three sections: [ANSI "\033[37m", TEXT "ABC", ANSI "\033[0m"].
+       | + ++/
+       |struct AnsiSectionRange
+       |{
+       |    private
+       |    {
+       |        const(char)[] _input;
+       |        size_t        _cursor;
+       |        AnsiSection   _front;
+       |        bool          _empty = true; // So .init.empty is true
+       |    }
+       |    
+       |    @safe @nogc nothrow pure:
+       |
+       |    ///
+      6|    this(const(char)[] input)
+       |    {
+      6|        this._input = input;
+      6|        this._empty = false;
+      6|        this.popFront();
+       |    }
+       |
+       |    ///
+       |    bool empty() const
+       |    {
+     21|        return this._empty;
+       |    }
+       |    
+       |    ///
+       |    AnsiSection front() const
+       |    {
+     18|        return this._front;
+       |    }
+       |
+       |    ///
+       |    void popFront()
+       |    {
+     12|        assert(!this.empty, "Cannot pop empty range.");
+       |
+     12|        if(this._cursor >= this._input.length)
+       |        {
+      3|            this._empty = true;
+      3|            return;
+       |        }
+       |
+      9|        if((this._input.length - this._cursor) >= ANSI_CSI.length 
+      9|        && this._input[this._cursor..this._cursor + ANSI_CSI.length] == ANSI_CSI)
+      5|            this.readSequence();
+       |        else
+      4|            this.readText();
+       |    }
+       |
+       |    private void readText()
+       |    {
+      4|        const start = this._cursor;
+       |        
+     20|        while(this._cursor < this._input.length)
+       |        {
+     34|            if((this._input.length - this._cursor) >= 2 && this._input[this._cursor..this._cursor+2] == ANSI_CSI)
+      2|                break;
+       |
+     16|            this._cursor++;
+       |        }
+       |
+      4|        this._front.isAnsiSequence = false;
+      4|        this._front.slice = this._input[start..this._cursor];
+       |    }
+       |
+       |    private void readSequence()
+       |    {
+      5|        const start = this._cursor;
+      5|        this._cursor += ANSI_CSI.length; // Already validated by popFront.
+       |
+     31|        while(this._cursor < this._input.length 
+     31|           && this.isValidAnsiChar(this._input[this._cursor]))
+     26|           this._cursor++;
+       |
+      5|        if(this._cursor < this._input.length)
+      5|            this._cursor++; // We've hit a non-ansi character, so we increment to include it in the output.
+       |
+      5|        this._front.isAnsiSequence = true;
+      5|        this._front.slice = this._input[start..this._cursor];
+       |    }
+       |
+       |    private bool isValidAnsiChar(char ch)
+       |    {
+     31|        return (
+     31|            (ch >= '0' && ch <= '9')
+     14|         || ch == ';'
+       |        );
+       |    }
+       |}
+       |///
+       |@("AnsiSectionRange")
+       |unittest
+       |{
+      1|    assert(AnsiSectionRange.init.empty);
+      1|    assert("".asAnsiSections.empty);
+       |
+      1|    auto r = "No Ansi".asAnsiSections;
+      1|    assert(!r.empty);
+      1|    assert(!r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "No Ansi");
+       |
+      1|    r = "\033[m".asAnsiSections;
+      1|    assert(!r.empty);
+      1|    assert(r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "\033[m");
+       |
+      1|    r = "\033[38;2;255;128;64;1;4;48;5;2m".asAnsiSections;
+      1|    assert(!r.empty);
+      1|    assert(r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "\033[38;2;255;128;64;1;4;48;5;2m");
+       |
+      1|    r = "\033[mABC\033[m".asAnsiSections;
+      1|    assert(r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "\033[m", r.front.slice);
+      1|    r.popFront();
+      1|    assert(!r.empty);
+      1|    assert(!r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "ABC", r.front.slice);
+      1|    r.popFront();
+      1|    assert(!r.empty);
+      1|    assert(r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "\033[m");
+      1|    r.popFront();
+      1|    assert(r.empty);
+       |
+      1|    r = "ABC\033[mDEF".asAnsiSections;
+      1|    assert(!r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "ABC");
+      1|    r.popFront();
+      1|    assert(r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "\033[m");
+      1|    r.popFront();
+      1|    assert(!r.front.isAnsiSequence);
+      1|    assert(r.front.slice == "DEF");
+      1|    r.popFront();
+      1|    assert(r.empty);
+       |}
+       |
+       |/+++ PUBLIC HELPERS +++/
+       |
+       |/// Determines if `CT` is a valid RGB data type.
+       |enum isUserDefinedRgbType(CT) =
+       |(
+       |    __traits(hasMember, CT, "r")
+       | && __traits(hasMember, CT, "g")
+       | && __traits(hasMember, CT, "b")
+       |);
+       |
+       |/++
+       | + Converts any suitable data type into an `AnsiColour`.
+       | +
+       | + Params:
+       | +  colour = The colour to convert.
+       | +
+       | + Returns:
+       | +  An `AnsiColour` created from the given `colour`.
+       | +
+       | + See_Also:
+       | +  `isUserDefinedRgbType`
+       | + ++/
+       |AnsiColour to(T : AnsiColour, CT)(CT colour)
+       |if(isUserDefinedRgbType!CT)
+       |{
+      2|    return AnsiColour(colour.r, colour.g, colour.b);
+       |}
+       |///
+       |@("to!AnsiColour(User defined)")
+       |@safe @nogc nothrow pure
+       |unittest
+       |{
+       |    static struct RGB
+       |    {
+       |        ubyte r;
+       |        ubyte g;
+       |        ubyte b;
+       |    }
+       |
+      1|    assert(RGB(255, 128, 64).to!AnsiColour == AnsiColour(255, 128, 64));
+       |}
+       |
+       |/// ditto.
+       |AnsiColour toBg(T)(T c)
+       |{
+      1|    auto colour = to!AnsiColour(c);
+      1|    colour.isBg = IsBgColour.yes;
+      1|    return colour;
+       |}
+       |///
+       |@("toBg")
+       |@safe @nogc nothrow pure
+       |unittest
+       |{
+       |    static struct RGB
+       |    {
+       |        ubyte r;
+       |        ubyte g;
+       |        ubyte b;
+       |    }
+       |
+      1|    assert(RGB(255, 128, 64).toBg == AnsiColour(255, 128, 64, IsBgColour.yes));
+       |}
+       |
+       |/++
+       | + Creates an `AnsiTextLite` from the given `text`. This function is mostly used when using
+       | + the fluent UFCS chaining pattern.
+       | +
+       | + Params:
+       | +  text = The text to use.
+       | +
+       | + Returns:
+       | +  An `AnsiTextLite` from the given `text`.
+       | + ++/
+       |@safe @nogc
+       |AnsiTextLite ansi(const(char)[] text) nothrow pure
+       |{
+      1|    return AnsiTextLite(text);
+       |}
+       |///
+       |@("ansi")
+       |unittest
+       |{
+       |    version(none)
+       |    {
+       |        import std.stdio;
+       |        writeln("Hello, World!".ansi
+       |                               .fg(Ansi4BitColour.red)
+       |                               .bg(AnsiRgbColour(128, 128, 128))
+       |                               .style(AnsiStyle.init.bold.underline)
+       |        );
+       |    }
+       |}
+       |
+       |/++
+       | + Constructs an `AnsiSectionRange` from the given `slice`.
+       | + ++/
+       |@safe @nogc
+       |AnsiSectionRange asAnsiSections(const(char)[] slice) nothrow pure
+       |{
+      6|    return AnsiSectionRange(slice);
+       |}
+       |
+       |/++
+       | + Enables ANSI support on windows via `SetConsoleMode`. This function is no-op on non-Windows platforms.
+       | + ++/
+       |void ansiEnableWindowsSupport() @nogc nothrow
+       |{
+       |    version(Windows)
+       |    {
+       |        import core.sys.windows.windows : HANDLE, DWORD, GetStdHandle, STD_OUTPUT_HANDLE, GetConsoleMode, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+       |        HANDLE stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+       |        DWORD mode = 0;
+       |        GetConsoleMode(stdOut, &mode);
+       |        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+       |        SetConsoleMode(stdOut, mode);
+       |    }
+       |}
+       |
+       |/+++ PRIVATE HELPERS +++/
+       |private char[] numToStrBase10(NumT)(char[] buffer, NumT num)
+       |{
+     84|    if(num == 0)
+       |    {
+0000000|        if(buffer.length > 0)
+       |        {
+0000000|            buffer[0] = '0';
+0000000|            return buffer[0..1];
+       |        }
+       |        else
+0000000|            return null;
+       |    }
+       |
+     84|    const CHARS = "0123456789";
+       |
+     84|    ptrdiff_t i = buffer.length;
+    436|    while(i > 0 && num > 0)
+       |    {
+    144|        buffer[--i] = CHARS[num % 10];
+    144|        num /= 10;
+       |    }
+       |
+     84|    return buffer[i..$];
+       |}
+       |///
+       |@("numToStrBase10")
+       |unittest
+       |{
+      1|    char[2] b;
+      1|    assert(numToStrBase10(b, 32) == "32");
+       |}
+       |
+       |private NumT strToNum(NumT)(const(char)[] slice)
+       |{
+     53|    NumT num;
+       |
+    543|    foreach(i, ch; slice)
+       |    {
+     96|        const exponent = slice.length - (i + 1);
+     96|        const tens     = 10 ^^ exponent;
+     96|        const chNum    = cast(NumT)(ch - '0');
+       |
+     96|        if(tens == 0)
+0000000|            num += chNum;
+       |        else
+     96|            num += chNum * tens;
+       |    }
+       |
+     53|    return num;
+       |}
+       |///
+       |@("strToNum")
+       |unittest
+       |{
+      1|    assert("1".strToNum!int == 1);
+      1|    assert("11".strToNum!int == 11);
+      1|    assert("901".strToNum!int == 901);
+       |}
+source/jansi.d is 80% covered

@@ -1,0 +1,16 @@
+.dub
+docs.json
+__dummy.html
+docs/
+/dcover
+dcover.so
+dcover.dylib
+dcover.dll
+dcover.a
+dcover.lib
+dcover-test-*
+*.exe
+*.o
+*.obj
+*.lst
+index.html

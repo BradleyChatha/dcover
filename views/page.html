@@ -1,0 +1,111 @@
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+        <style>
+            td {
+                height: 1rem;
+            }
+
+            td.number {
+                width: 100px;
+            }
+
+            td pre {
+                margin: 0 auto;
+            }
+
+            pre {
+                font-weight: bold;
+            }
+
+            pre.covered {
+                color: rgb(44, 212, 149);
+            }
+
+            pre.uncovered {
+                color: rgb(192, 0, 0);
+            }
+
+            body {
+                color: rgb(80, 80, 80);
+                background: black;
+                font-size: 18px;
+            }
+
+            header * {
+                display: flex;
+                align-self: center;
+                padding-left: 1rem;
+            }
+
+            header {
+                display: flex;
+                flex-direction: row;
+                height: 40px;
+                width: 100vw;
+                border-bottom: solid 1px white;
+                margin-bottom: 2rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="app">
+            <header>
+                <select v-model="filename">
+                    <option v-for="f in files" :key="f.file" :value="f.file">
+                        {{ f.file }}
+                    </option>
+                </select>
+                <pre>
+not tracked
+                </pre>
+                <pre class="uncovered">
+not covered
+                </pre>
+                <pre class="covered">
+covered
+                </pre>
+            </header>
+            <article>
+                <table>
+                    <tbody>
+                        <template v-for="f in files.filter(f => f.file == filename)" :key="f.file">
+                            <tr v-for="line in f.lines" :key="line.number">
+                                <td class="number">
+                                    {{ line.number+1 }}
+                                </td>
+                                <td class="text">
+                                    <pre :class="getClass(line)">{{ line.text }}</pre>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </article>
+        </div>
+        <script src="https://cdn.jsdelivr.net/npm/vue@2"></script>
+        <script>
+            app = new Vue({
+                el: '#app',
+                data: {
+                    files: [
+                        %s
+                    ],
+                    filename: "",
+                },
+                methods: {
+                    getClass(line) {
+                        if(!line.tracked)
+                            return ""
+                        else if(line.hits > 0)
+                            return "covered"
+                        else
+                            return "uncovered"
+                    }
+                },
+            })
+
+            app.filename = app.files[0].file
+        </script>
+    </body>
+</html>

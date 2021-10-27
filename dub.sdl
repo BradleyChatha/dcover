@@ -1,0 +1,6 @@
+name "dcover"
+description "A minimal D application."
+authors "Brad"
+copyright "Copyright © 2021, Brad"
+license "proprietary"
+dependency "jcli" version="~>0.22.4"
