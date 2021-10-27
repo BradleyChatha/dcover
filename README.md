@@ -7,7 +7,7 @@ Given a directory of D coverage files (.lst), this tool will create a HTML file 
 # Usage
 
 ```d
-dub test -b unittest-cov; dub run dcover .
+dub test -b unittest-cov; dub run dcover -- .
 ```
 
 This *should* generate an `index.html` file, which is very similar to the output of golang's `cover` tool.
