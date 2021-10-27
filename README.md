@@ -1,6 +1,6 @@
 # Overview
 
-dcover is a very shameless copycat of golang's `cover` tool.
+dcover is a very shameless copycat of golang's `cover` tool (in terms of its HTML output option).
 
 Given a directory of D coverage files (.lst), this tool will create a HTML file that visually shows which lines have been covered, and which have not.
 
